@@ -73,7 +73,7 @@ export async function GET(request: NextRequest) {
 
       // 1. In-memory instantly broadcast listener
       const listener = (payload: { type: string, clientId?: string, blocks?: unknown[] }) => {
-        if (payload && payload.type === 'sync' && payload.clientId !== clientId && payload.blocks?.length > 0) {
+        if (payload && payload.type === 'sync' && payload.clientId !== clientId && payload.blocks && payload.blocks.length > 0) {
            sendEvent({ blocks: payload.blocks, nextRowid: currentRowid });
         }
       };
