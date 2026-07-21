@@ -2,6 +2,23 @@ import { NextResponse } from 'next/server';
 import prisma from '@/lib/server/db';
 import { getSession } from '@/lib/server/auth';
 import { publishSyncEvent } from '@/lib/server/pubsub';
+import { Prisma, Block } from '@prisma/client';
+
+interface OperationPayload {
+  id: string;
+  documentId: string;
+  type: string;
+  content: string;
+  index: string;
+  version: number;
+  clientId: string;
+  clientTimestamp: number | string | Date;
+  deleted: boolean;
+}
+
+interface IncomingOperation {
+  payload: OperationPayload;
+}
 
 export async function POST(request: Request) {
   try {
@@ -35,18 +52,18 @@ export async function POST(request: Request) {
     await publishSyncEvent(documentId, {
       type: 'sync',
       clientId, // The sender's ID
-      blocks: operations.map((op: any) => op.payload)
+      blocks: operations.map((op: IncomingOperation) => op.payload)
     });
 
     // 2. Offload all CRDT resolution and database writes to a background task
     (async () => {
       try {
-        const blockIds = operations.map((op: any) => op.payload.id);
+        const blockIds = operations.map((op: IncomingOperation) => op.payload.id);
         const existingBlocks = await prisma.block.findMany({ where: { id: { in: blockIds } } });
-        const existingMap = new Map(existingBlocks.map(b => [b.id, b]));
+        const existingMap = new Map(existingBlocks.map((b: Block) => [b.id, b]));
 
         const blockUpdates = new Map();
-        const logsData: any[] = [];
+        const logsData: Prisma.SyncLogCreateManyInput[] = [];
 
         for (const op of operations) {
           const b = op.payload;
@@ -82,7 +99,7 @@ export async function POST(request: Request) {
           }
         }
 
-        let txs: any[] = [];
+        let txs: Prisma.PrismaPromise<unknown>[] = [];
 
         if (logsData.length > 0) {
           for (const b of blockUpdates.values()) {

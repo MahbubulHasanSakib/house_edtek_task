@@ -43,7 +43,7 @@ export async function initPubSub() {
 /**
  * Publishes an event to Postgres, which will broadcast it to ALL worker processes.
  */
-export async function publishSyncEvent(documentId: string, payload: any) {
+export async function publishSyncEvent(documentId: string, payload: Record<string, unknown>) {
   // Use a temporary client for publishing so we don't block the listener
   const publishClient = new Client({ connectionString: process.env.DATABASE_URL });
   

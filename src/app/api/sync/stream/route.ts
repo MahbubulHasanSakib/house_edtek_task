@@ -61,7 +61,7 @@ export async function GET(request: NextRequest) {
         isClosed = true;
       });
 
-      const sendEvent = (data: any) => {
+      const sendEvent = (data: Record<string, unknown>) => {
         if (!isClosed) {
           try {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
@@ -72,7 +72,7 @@ export async function GET(request: NextRequest) {
       };
 
       // 1. In-memory instantly broadcast listener
-      const listener = (payload: any) => {
+      const listener = (payload: { type: string, clientId?: string, blocks?: unknown[] }) => {
         if (payload && payload.type === 'sync' && payload.clientId !== clientId && payload.blocks?.length > 0) {
            sendEvent({ blocks: payload.blocks, nextRowid: currentRowid });
         }
