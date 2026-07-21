@@ -18,7 +18,7 @@ export function useSnapshots({ documentId, blocks, currentRole, reloadBlocks, sy
 
   const loadSnapshots = useCallback(async () => {
     try {
-      const res = await fetch(`/api/document/${documentId}/snapshot`);
+      const res = await fetch(`/api/document/${documentId}/snapshots`);
       if (res.ok) {
         const data = await res.json();
         setSnapshots(data.snapshots || []);
@@ -33,7 +33,7 @@ export function useSnapshots({ documentId, blocks, currentRole, reloadBlocks, sy
     if (currentRole === 'VIEWER') return;
     setIsCreatingSnapshot(true);
     try {
-      const res = await fetch(`/api/document/${documentId}/snapshot`, {
+      const res = await fetch(`/api/document/${documentId}/snapshots`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -55,17 +55,35 @@ export function useSnapshots({ documentId, blocks, currentRole, reloadBlocks, sy
     if (currentRole === 'VIEWER') return;
     try {
       const snapshotBlocks: BlockData[] = JSON.parse(snapshot.data);
+      const currentBlocks = await localDb.getBlocks(documentId);
+      const currentBlocksMap = new Map(currentBlocks.map(b => [b.id, b]));
       
-      const newVersionBlocks = snapshotBlocks.map(b => ({
-        ...b,
-        version: b.version + 100, // bump version heavily to force LWW overwrite
-        clientTimestamp: Date.now()
-      }));
+      const snapshotBlockIds = new Set(snapshotBlocks.map(b => b.id));
+      
+      // 1. Delete blocks that exist now but didn't exist in the snapshot
+      const blocksToDelete = currentBlocks.filter(b => !snapshotBlockIds.has(b.id) && !b.deleted);
+      for (const block of blocksToDelete) {
+        const deletedBlock = { ...block, deleted: true, version: block.version + 1, clientTimestamp: Date.now() };
+        await localDb.saveBlock(deletedBlock);
+        syncManagerRef.current?.queueOperation('UPDATE_BLOCK', deletedBlock);
+      }
+
+      // 2. Restore blocks from the snapshot, ensuring version is higher than current
+      const newVersionBlocks = snapshotBlocks.map(b => {
+        const current = currentBlocksMap.get(b.id);
+        return {
+          ...b,
+          version: current ? current.version + 1 : b.version + 1,
+          clientTimestamp: Date.now(),
+          deleted: false
+        };
+      });
 
       for (const block of newVersionBlocks) {
         await localDb.saveBlock(block);
         syncManagerRef.current?.queueOperation('UPDATE_BLOCK', block);
       }
+      
       setIsSnapshotModalOpen(false);
       await reloadBlocks();
     } catch (e) {

@@ -14,6 +14,8 @@ export class SyncManager {
   private onRoleUpdates?: (updates: any[]) => void;
   private onlineHandler = () => this.handleOnline();
   private offlineHandler = () => this.handleOffline();
+  private broadcastChannel: BroadcastChannel | null = null;
+  private eventSource: EventSource | null = null;
 
   constructor(
     documentId: string,
@@ -36,6 +38,19 @@ export class SyncManager {
 
   public start() {
     this.stopped = false;
+    
+    // Setup BroadcastChannel for 0ms same-browser sync
+    if (typeof window !== 'undefined') {
+      this.broadcastChannel = new BroadcastChannel(`doc:${this.documentId}`);
+      this.broadcastChannel.onmessage = async (event) => {
+        if (event.data.type === 'blocks' && event.data.clientId !== this.clientId) {
+          const blocks = event.data.blocks;
+          await localDb.saveBlocks(blocks);
+          this.onRemoteBlocks(blocks);
+        }
+      };
+    }
+
     this.startLongPoll();
     // Flush pending operations every 3s
     this.flushTimer = setInterval(() => this.flushOfflineQueue(), 3000);
@@ -44,6 +59,14 @@ export class SyncManager {
   public stop() {
     this.stopped = true;
     if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.broadcastChannel) {
+      this.broadcastChannel.close();
+      this.broadcastChannel = null;
+    }
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
     if (typeof window !== 'undefined') {
       window.removeEventListener('online', this.onlineHandler);
       window.removeEventListener('offline', this.offlineHandler);
@@ -63,70 +86,66 @@ export class SyncManager {
     this.polling = false; // stop polling loop
   }
 
-  private async startLongPoll() {
+  private startLongPoll() {
     if (this.polling || this.stopped) return;
     this.polling = true;
-    console.log('[SyncManager] Starting long-poll loop, rowid:', this.pollRowid);
+    console.log('[SyncManager] Starting SSE stream, rowid:', this.pollRowid);
 
-    while (!this.stopped && this.status !== 'offline') {
-      try {
-        const url = `/api/sync/stream?documentId=${this.documentId}&clientId=${this.clientId}&afterRowid=${this.pollRowid}`;
-        console.log('[SyncManager] Polling:', url);
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 25000);
-
-        const response = await fetch(url, { signal: controller.signal });
-        clearTimeout(timeoutId);
-
-        if (response.ok) {
-          const data = await response.json();
-          console.log('[SyncManager] Got response, nextRowid:', data.nextRowid, 'blocks:', data.blocks?.length ?? 0);
-
-          if (typeof data.nextRowid === 'number') {
-            this.pollRowid = data.nextRowid;
-          }
-
-          if (data.roleUpdates && data.roleUpdates.length > 0 && this.onRoleUpdates) {
-            this.onRoleUpdates(data.roleUpdates);
-          }
-
-          if (data.blocks && data.blocks.length > 0) {
-            for (const block of data.blocks) {
-              const normalized: BlockData = {
-                ...block,
-                clientTimestamp: typeof block.clientTimestamp === 'string'
-                  ? new Date(block.clientTimestamp).getTime()
-                  : block.clientTimestamp
-              };
-              await localDb.saveBlock(normalized);
-            }
-            this.onRemoteBlocks(data.blocks);
-          }
-        } else if (response.status === 401) {
-          console.log('[SyncManager] Auth error, stopping');
-          this.polling = false;
-          return;
-        }
-      } catch (e: any) {
-        if (e?.name !== 'AbortError') {
-          // If it's a standard network fetch failure (like offline or server restart), don't throw a noisy error
-          if (e instanceof TypeError && (e.message.includes('Failed to fetch') || e.message.includes('Load failed'))) {
-            console.log('[SyncManager] Connection temporarily lost, retrying...');
-          } else {
-            console.error('[SyncManager] Long-poll error:', e.message);
-          }
-          await new Promise(r => setTimeout(r, 2000));
-        } else {
-          console.log('[SyncManager] Request timed out, reconnecting...');
-        }
-      }
+    if (this.eventSource) {
+      this.eventSource.close();
     }
 
-    this.polling = false;
-    console.log('[SyncManager] Poll loop stopped');
+    const url = `/api/sync/stream?documentId=${this.documentId}&clientId=${this.clientId}&afterRowid=${this.pollRowid}`;
+    this.eventSource = new EventSource(url);
+
+    this.eventSource.onmessage = async (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('[SyncManager] Got SSE data, nextRowid:', data.nextRowid, 'blocks:', data.blocks?.length ?? 0);
+
+        if (typeof data.nextRowid === 'number') {
+          this.pollRowid = data.nextRowid;
+        }
+
+        if (data.roleUpdates && data.roleUpdates.length > 0 && this.onRoleUpdates) {
+          this.onRoleUpdates(data.roleUpdates);
+        }
+
+        if (data.blocks && data.blocks.length > 0) {
+          const normalizedBlocks = data.blocks.map((block: any) => ({
+            ...block,
+            clientTimestamp: typeof block.clientTimestamp === 'string'
+              ? new Date(block.clientTimestamp).getTime()
+              : block.clientTimestamp
+          }));
+          await localDb.saveBlocks(normalizedBlocks);
+          this.onRemoteBlocks(data.blocks);
+        }
+      } catch (e) {
+        console.error('[SyncManager] Failed to parse SSE data', e);
+      }
+    };
+
+    this.eventSource.onerror = () => {
+      console.log('[SyncManager] SSE connection lost, browser will auto-reconnect...');
+      if (this.status === 'online' && !navigator.onLine) {
+         this.status = 'offline';
+         this.onStatusChange(this.status);
+      }
+    };
   }
 
   public async queueOperation(action: 'UPDATE_BLOCK', payload: BlockData) {
+    // Broadcast instantly to other tabs in the same browser (0ms latency!)
+    // We do this BEFORE awaiting IndexedDB to avoid any blocking!
+    if (this.broadcastChannel) {
+      this.broadcastChannel.postMessage({
+        type: 'blocks',
+        clientId: this.clientId,
+        blocks: [payload]
+      });
+    }
+
     const op: SyncOperation = {
       id: crypto.randomUUID(),
       documentId: this.documentId,
@@ -135,26 +154,32 @@ export class SyncManager {
       timestamp: Date.now()
     };
     await localDb.addOperation(op);
-    // Flush immediately for snappy experience
+
+    // Flush immediately to the backend for other devices
     this.flushOfflineQueue();
   }
+
+  private isFlushing = false;
 
   private async flushOfflineQueue() {
     if (this.status === 'offline') return;
     if (!navigator.onLine) return;
+    if (this.isFlushing) return;
 
-    const ops = await localDb.getOperations();
-    const docOps = ops.filter(o => o.documentId === this.documentId);
-    if (docOps.length === 0) return;
-
-    this.status = 'syncing';
-    this.onStatusChange(this.status);
+    this.isFlushing = true;
 
     try {
+      const ops = await localDb.getOperations();
+      const docOps = ops.filter(o => o.documentId === this.documentId);
+      if (docOps.length === 0) return;
+
+      this.status = 'syncing';
+      this.onStatusChange(this.status);
+
       const response = await fetch('/api/sync/push', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ documentId: this.documentId, operations: docOps })
+        body: JSON.stringify({ documentId: this.documentId, clientId: this.clientId, operations: docOps })
       });
 
       if (response.ok) {
@@ -167,6 +192,14 @@ export class SyncManager {
     } finally {
       this.status = navigator.onLine ? 'online' : 'offline';
       this.onStatusChange(this.status);
+      this.isFlushing = false;
+
+      // If more operations queued up while we were flushing, flush them now!
+      localDb.getOperations().then(ops => {
+        if (ops.some(o => o.documentId === this.documentId)) {
+          this.flushOfflineQueue();
+        }
+      });
     }
   }
 }

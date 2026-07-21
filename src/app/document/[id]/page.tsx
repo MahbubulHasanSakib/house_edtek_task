@@ -28,10 +28,11 @@ export default async function DocumentPage({ params }: { params: Promise<{ id: s
   }
 
   const role = isOwner ? 'OWNER' : doc.permissions[0].role;
+  const allUsers = await prisma.user.findMany({ select: { id: true, email: true, name: true } });
 
   return (
     <div className="flex flex-col h-full bg-background min-h-screen">
-      <EditorClient documentId={documentId} initialTitle={doc.title} role={role} currentUserEmail={session.email} />
+      <EditorClient documentId={documentId} initialTitle={doc.title} role={role} currentUserEmail={session.email} allUsers={allUsers} />
     </div>
   );
 }

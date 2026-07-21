@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/lib/server/db';
 import { getSession } from '@/lib/server/auth';
-import { sseEmitter } from '@/lib/server/sse';
+import { publishSyncEvent } from '@/lib/server/pubsub';
 
 export async function POST(request: Request) {
   try {
@@ -10,7 +10,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const { documentId, operations } = await request.json();
+    const { documentId, clientId, operations } = await request.json();
     if (!documentId || !Array.isArray(operations)) {
       return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
@@ -31,77 +31,99 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
-    const appliedBlocks = [];
+    // 1. Instantly broadcast to ALL worker processes via Postgres NOTIFY!
+    await publishSyncEvent(documentId, {
+      type: 'sync',
+      clientId, // The sender's ID
+      blocks: operations.map((op: any) => op.payload)
+    });
 
-    // Apply CRDT LWW Operations sequentially
-    for (const op of operations) {
-      const b = op.payload;
-      
-      const existing = await prisma.block.findUnique({ where: { id: b.id } });
+    // 2. Offload all CRDT resolution and database writes to a background task
+    (async () => {
+      try {
+        const blockIds = operations.map((op: any) => op.payload.id);
+        const existingBlocks = await prisma.block.findMany({ where: { id: { in: blockIds } } });
+        const existingMap = new Map(existingBlocks.map(b => [b.id, b]));
 
-      let shouldApply = false;
-      if (!existing) {
-        shouldApply = true;
-      } else {
-        // LWW Resolution
-        if (b.version > existing.version) {
-          shouldApply = true;
-        } else if (b.version === existing.version) {
-          if (b.clientTimestamp > existing.clientTimestamp.getTime()) {
+        const blockUpdates = new Map();
+        const logsData: any[] = [];
+
+        for (const op of operations) {
+          const b = op.payload;
+          const existing = blockUpdates.get(b.id) || existingMap.get(b.id);
+
+          let shouldApply = false;
+          if (!existing) {
             shouldApply = true;
-          } else if (b.clientTimestamp === existing.clientTimestamp.getTime()) {
-            if (b.clientId > existing.clientId) {
+          } else {
+            if (b.version > existing.version) {
               shouldApply = true;
+            } else if (b.version === existing.version) {
+              const bTime = typeof b.clientTimestamp === 'string' ? new Date(b.clientTimestamp).getTime() : b.clientTimestamp;
+              const eTime = existing.clientTimestamp instanceof Date ? existing.clientTimestamp.getTime() : existing.clientTimestamp;
+              
+              if (bTime > eTime) {
+                shouldApply = true;
+              } else if (bTime === eTime) {
+                if (b.clientId > existing.clientId) {
+                  shouldApply = true;
+                }
+              }
             }
           }
+
+          if (shouldApply) {
+            blockUpdates.set(b.id, b);
+            logsData.push({
+              documentId,
+              operation: JSON.stringify(op),
+              clientId: clientId // Use the sender's ID, not the block creator's ID
+            });
+          }
         }
-      }
 
-      if (shouldApply) {
-        const updated = await prisma.block.upsert({
-          where: { id: b.id },
-          create: {
-            id: b.id,
-            documentId: b.documentId,
-            type: b.type,
-            content: b.content,
-            index: b.index,
-            version: b.version,
-            clientId: b.clientId,
-            clientTimestamp: new Date(b.clientTimestamp),
-            deleted: b.deleted
-          },
-          update: {
-            type: b.type,
-            content: b.content,
-            index: b.index,
-            version: b.version,
-            clientId: b.clientId,
-            clientTimestamp: new Date(b.clientTimestamp),
-            deleted: b.deleted
+        let txs: any[] = [];
+
+        if (logsData.length > 0) {
+          for (const b of blockUpdates.values()) {
+            txs.push(prisma.block.upsert({
+              where: { id: b.id },
+              create: {
+                id: b.id,
+                documentId: b.documentId,
+                type: b.type,
+                content: b.content,
+                index: b.index,
+                version: b.version,
+                clientId: b.clientId,
+                clientTimestamp: new Date(b.clientTimestamp),
+                deleted: b.deleted
+              },
+              update: {
+                type: b.type,
+                content: b.content,
+                index: b.index,
+                version: b.version,
+                clientId: b.clientId,
+                clientTimestamp: new Date(b.clientTimestamp),
+                deleted: b.deleted
+              }
+            }));
           }
-        });
-        
-        appliedBlocks.push(updated);
 
-        await prisma.syncLog.create({
-          data: {
-            documentId,
-            operation: JSON.stringify(op),
-            clientId: op.payload.clientId
-          }
-        });
+          txs.push(prisma.syncLog.createMany({ data: logsData }));
+        }
+
+        if (txs.length > 0) {
+          await prisma.$transaction(txs, { timeout: 15000 });
+        }
+      } catch (error) {
+        console.error('Background sync error:', error);
       }
-    }
+    })();
 
-    if (appliedBlocks.length > 0) {
-      sseEmitter.emit(`doc:${documentId}`, {
-        type: 'sync',
-        blocks: appliedBlocks
-      });
-    }
-
-    return NextResponse.json({ success: true, appliedCount: appliedBlocks.length });
+    // 3. Return instantly to unblock the client!
+    return NextResponse.json({ success: true, appliedCount: operations.length });
   } catch (error) {
     console.error('Sync error:', error);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

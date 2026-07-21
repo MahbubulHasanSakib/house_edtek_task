@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
 }
 
 model User {
@@ -69,6 +69,7 @@ model Snapshot {
 
 model SyncLog {
   id         String   @id @default(uuid())
+  sequenceId Int      @default(autoincrement()) @unique
   documentId String
   document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
   operation  String   // JSON of the operation pushed

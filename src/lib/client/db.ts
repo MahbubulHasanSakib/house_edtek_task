@@ -50,7 +50,7 @@ export class LocalDB {
     });
   }
 
-  async saveBlock(block: BlockData): Promise<void> {
+  async saveBlock(block: BlockData): Promise<boolean> {
     await this.init();
     return new Promise((resolve, reject) => {
       const transaction = this.db!.transaction('blocks', 'readwrite');
@@ -79,13 +79,70 @@ export class LocalDB {
 
         if (shouldApply) {
           const putReq = store.put(block);
-          putReq.onsuccess = () => resolve();
+          putReq.onsuccess = () => resolve(true);
           putReq.onerror = () => reject(putReq.error);
         } else {
-          resolve(); // Ignored because local is newer
+          resolve(false); // Ignored because local is newer
         }
       };
       getReq.onerror = () => reject(getReq.error);
+    });
+  }
+
+  async saveBlocks(blocks: BlockData[]): Promise<void> {
+    if (blocks.length === 0) return;
+    await this.init();
+    return new Promise((resolve, reject) => {
+      const transaction = this.db!.transaction('blocks', 'readwrite');
+      const store = transaction.objectStore('blocks');
+      
+      let pending = blocks.length;
+      let hasError = false;
+
+      for (const block of blocks) {
+        if (hasError) break;
+        const getReq = store.get(block.id);
+        
+        getReq.onsuccess = () => {
+          const existing = getReq.result as BlockData | undefined;
+          let shouldApply = false;
+          
+          if (!existing) {
+            shouldApply = true;
+          } else {
+            if (block.version > existing.version) {
+              shouldApply = true;
+            } else if (block.version === existing.version) {
+              if (block.clientTimestamp > existing.clientTimestamp) {
+                shouldApply = true;
+              } else if (block.clientTimestamp === existing.clientTimestamp) {
+                if (block.clientId > existing.clientId) {
+                  shouldApply = true;
+                }
+              }
+            }
+          }
+
+          if (shouldApply) {
+            const putReq = store.put(block);
+            putReq.onsuccess = () => {
+              pending--;
+              if (pending === 0 && !hasError) resolve();
+            };
+            putReq.onerror = () => {
+              hasError = true;
+              reject(putReq.error);
+            };
+          } else {
+            pending--;
+            if (pending === 0 && !hasError) resolve();
+          }
+        };
+        getReq.onerror = () => {
+          hasError = true;
+          reject(getReq.error);
+        };
+      }
     });
   }
 

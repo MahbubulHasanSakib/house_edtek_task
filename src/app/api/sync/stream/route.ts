@@ -1,13 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSession } from '@/lib/server/auth';
 import prisma from '@/lib/server/db';
-import Database from 'better-sqlite3';
+import { sseEmitter } from '@/lib/server/sse';
+import { initPubSub } from '@/lib/server/pubsub';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 // Long-polling: uses SQLite rowid for reliable ordering (avoids timestamp format issues)
 export async function GET(request: NextRequest) {
+  // Ensure this worker is listening for cross-process pubsub events
+  await initPubSub();
+
   const session = await getSession();
   if (!session) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -36,69 +40,103 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
-  // Use better-sqlite3 directly for rowid-based queries
-  const db = new Database('dev.db', { readonly: true });
-
-  // Seed cursor: if no afterRowid, start from current max rowid
+  // Seed cursor: if no afterRowid, start from current max sequenceId
   let currentRowid = afterRowid;
   if (currentRowid === 0) {
-    const row = db.prepare(
-      `SELECT MAX(rowid) as maxRowid FROM SyncLog WHERE documentId = ?`
-    ).get(documentId) as { maxRowid: number | null };
-    currentRowid = row?.maxRowid ?? 0;
+    const row = await prisma.syncLog.findFirst({
+      where: { documentId },
+      orderBy: { sequenceId: 'desc' },
+      select: { sequenceId: true }
+    });
+    currentRowid = row?.sequenceId ?? 0;
   }
 
-  const maxWait = 20000;
-  const pollInterval = 500;
-  const deadline = Date.now() + maxWait;
+  const encoder = new TextEncoder();
 
-  try {
-    while (Date.now() < deadline) {
-      if (request.signal.aborted) break;
+  const stream = new ReadableStream({
+    async start(controller) {
+      let isClosed = false;
 
-      // Query for new logs from OTHER clients with rowid > cursor
-      const logs = db.prepare(
-        `SELECT rowid, id, clientId, operation FROM SyncLog 
-         WHERE documentId = ? AND clientId != ? AND rowid > ?
-         ORDER BY rowid ASC LIMIT 50`
-      ).all(documentId, clientId, currentRowid) as Array<{
-        rowid: number; id: string; clientId: string; operation: string;
-      }>;
+      request.signal.addEventListener('abort', () => {
+        isClosed = true;
+      });
 
-      if (logs.length > 0) {
-        const newRowid = logs[logs.length - 1].rowid;
-
-        const blockIds = Array.from(new Set(
-          logs.map(l => {
-            try { 
-              const op = JSON.parse(l.operation);
-              return op.action ? op.payload?.id : null; 
-            } catch { return null; }
-          }).filter(Boolean)
-        )) as string[];
-
-        const roleUpdates = logs.map(l => {
+      const sendEvent = (data: any) => {
+        if (!isClosed) {
           try {
-            const op = JSON.parse(l.operation);
-            return op.type === 'ROLE_UPDATE' ? op : null;
-          } catch { return null; }
-        }).filter(Boolean);
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+          } catch (e) {
+            isClosed = true;
+          }
+        }
+      };
 
-        const blocks = blockIds.length > 0
-          ? await prisma.block.findMany({ where: { id: { in: blockIds } } })
-          : [];
+      // 1. In-memory instantly broadcast listener
+      const listener = (payload: any) => {
+        if (payload && payload.type === 'sync' && payload.clientId !== clientId && payload.blocks?.length > 0) {
+           sendEvent({ blocks: payload.blocks, nextRowid: currentRowid });
+        }
+      };
 
-        db.close();
-        return NextResponse.json({ blocks, roleUpdates, nextRowid: newRowid });
+      sseEmitter.on(`doc:${documentId}`, listener);
+      
+      request.signal.addEventListener('abort', () => {
+        sseEmitter.off(`doc:${documentId}`, listener);
+      });
+
+      // 2. Fallback polling loop (runs while connection is open)
+      while (!isClosed) {
+        try {
+          const logs = await prisma.syncLog.findMany({
+            where: {
+              documentId,
+              clientId: { not: clientId },
+              sequenceId: { gt: currentRowid }
+            },
+            orderBy: { sequenceId: 'asc' },
+            take: 50
+          });
+
+          if (logs.length > 0) {
+            currentRowid = logs[logs.length - 1].sequenceId;
+
+            const blockIds = Array.from(new Set(
+              logs.map(l => {
+                try { 
+                  const op = JSON.parse(l.operation);
+                  return op.action ? op.payload?.id : null; 
+                } catch { return null; }
+              }).filter(Boolean)
+            )) as string[];
+
+            const roleUpdates = logs.map(l => {
+              try {
+                const op = JSON.parse(l.operation);
+                return op.type === 'ROLE_UPDATE' ? op : null;
+              } catch { return null; }
+            }).filter(Boolean);
+
+            const blocks = blockIds.length > 0
+              ? await prisma.block.findMany({ where: { id: { in: blockIds } } })
+              : [];
+
+            sendEvent({ blocks, roleUpdates, nextRowid: currentRowid });
+          }
+        } catch (e) {
+          // ignore DB polling errors during stream
+        }
+
+        // Wait 2 seconds before polling DB again (events are instant via emitter!)
+        await new Promise(r => setTimeout(r, 2000));
       }
-
-      await new Promise(resolve => setTimeout(resolve, pollInterval));
     }
-  } catch (e) {
-    // ignore abort errors
-  } finally {
-    try { db.close(); } catch {}
-  }
+  });
 
-  return NextResponse.json({ blocks: [], nextRowid: currentRowid });
+  return new NextResponse(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+    },
+  });
 }

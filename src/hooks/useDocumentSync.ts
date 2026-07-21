@@ -115,8 +115,10 @@ export function useDocumentSync({ documentId, initialTitle, initialRole, current
     setBlocks(prev => prev.map(b => {
       if (b.id === id) {
         const updated = { ...b, content: newContent, version: b.version + 1, clientTimestamp: Date.now() };
-        localDb.saveBlock(updated).then(() => {
-          syncManagerRef.current?.queueOperation('UPDATE_BLOCK', updated);
+        // Save to localDb in background, but broadcast instantly
+        syncManagerRef.current?.queueOperation('UPDATE_BLOCK', updated);
+        localDb.saveBlock(updated).then((applied) => {
+          if (!applied) reloadBlocks();
         });
         return updated;
       }
@@ -157,8 +159,10 @@ export function useDocumentSync({ documentId, initialTitle, initialRole, current
         return newBlocks;
       });
 
-      localDb.saveBlock(newBlock).then(() => {
-        syncManagerRef.current?.queueOperation('UPDATE_BLOCK', newBlock);
+      // Save to localDb in background, but broadcast instantly
+      syncManagerRef.current?.queueOperation('UPDATE_BLOCK', newBlock);
+      localDb.saveBlock(newBlock).then((applied) => {
+        if (!applied) reloadBlocks();
       });
 
       setTimeout(() => {
@@ -172,8 +176,10 @@ export function useDocumentSync({ documentId, initialTitle, initialRole, current
         const deletedBlock = { ...blockToDel, deleted: true, version: blockToDel.version + 1, clientTimestamp: Date.now() };
         
         setBlocks(prev => prev.filter((_, i) => i !== index));
-        localDb.saveBlock(deletedBlock).then(() => {
-          syncManagerRef.current?.queueOperation('UPDATE_BLOCK', deletedBlock);
+        // Save to localDb in background, but broadcast instantly
+        syncManagerRef.current?.queueOperation('UPDATE_BLOCK', deletedBlock);
+        localDb.saveBlock(deletedBlock).then((applied) => {
+          if (!applied) reloadBlocks();
         });
 
         if (index > 0) {
