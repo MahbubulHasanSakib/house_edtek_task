@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import prisma from '@/lib/server/db';
 import { getSession } from '@/lib/server/auth';
 import { publishSyncEvent } from '@/lib/server/pubsub';
-import { Prisma, Block } from '@prisma/client';
+import { Block } from '@prisma/client';
 
 interface OperationPayload {
   id: string;
@@ -63,7 +63,7 @@ export async function POST(request: Request) {
         const existingMap = new Map(existingBlocks.map((b: Block) => [b.id, b]));
 
         const blockUpdates = new Map();
-        const logsData: Prisma.SyncLogCreateManyInput[] = [];
+        const logsData: { documentId: string; operation: string; clientId: string }[] = [];
 
         for (const op of operations) {
           const b = op.payload;
@@ -99,7 +99,7 @@ export async function POST(request: Request) {
           }
         }
 
-        let txs: Prisma.PrismaPromise<unknown>[] = [];
+        let txs: any[] = [];
 
         if (logsData.length > 0) {
           for (const b of blockUpdates.values()) {
