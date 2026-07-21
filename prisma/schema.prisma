@@ -1,0 +1,80 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String?
+  password  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ownedDocuments Document[]
+  permissions    DocumentPermission[]
+}
+
+model Document {
+  id        String   @id @default(uuid())
+  title     String   @default("Untitled")
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  permissions DocumentPermission[]
+  blocks      Block[]
+  snapshots   Snapshot[]
+  syncLogs    SyncLog[]
+}
+
+model DocumentPermission {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role       String   // "EDITOR", "VIEWER"
+
+  @@unique([documentId, userId])
+}
+
+model Block {
+  id              String   @id // Managed by client CRDT
+  documentId      String
+  document        Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  type            String
+  content         String
+  index           String   // Fractional index
+  version         Int
+  clientId        String
+  clientTimestamp DateTime
+  deleted         Boolean  @default(false)
+
+  @@unique([id, documentId])
+}
+
+model Snapshot {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  name       String
+  data       String   // JSON payload of all blocks at this point in time
+  createdAt  DateTime @default(now())
+}
+
+model SyncLog {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  operation  String   // JSON of the operation pushed
+  clientId   String
+  createdAt  DateTime @default(now())
+}
