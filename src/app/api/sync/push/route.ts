@@ -4,33 +4,59 @@ import { getSession } from '@/lib/server/auth';
 import { publishSyncEvent } from '@/lib/server/pubsub';
 import { Block } from '@prisma/client';
 
-interface OperationPayload {
-  id: string;
-  documentId: string;
-  type: string;
-  content: string;
-  index: string;
-  version: number;
-  clientId: string;
-  clientTimestamp: number | string | Date;
-  deleted: boolean;
-}
+import { z } from 'zod';
 
-interface IncomingOperation {
-  payload: OperationPayload;
-}
+const OperationPayloadSchema = z.object({
+  id: z.string(),
+  documentId: z.string(),
+  type: z.string(),
+  content: z.string(),
+  index: z.string(),
+  version: z.number(),
+  clientId: z.string(),
+  clientTimestamp: z.union([z.string(), z.number(), z.date()]),
+  deleted: z.boolean()
+});
+
+const IncomingOperationSchema = z.object({
+  payload: OperationPayloadSchema
+});
+
+type OperationPayload = z.infer<typeof OperationPayloadSchema>;
+type IncomingOperation = z.infer<typeof IncomingOperationSchema>;
 
 export async function POST(request: Request) {
   try {
+    // 1. OOM Prevention: Limit payload size by checking Content-Length header
+    const contentLength = Number(request.headers.get('content-length') || 0);
+    // 2MB limit
+    if (contentLength > 2 * 1024 * 1024) {
+      return NextResponse.json({ error: 'Payload Too Large' }, { status: 413 });
+    }
+
     const session = await getSession();
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const { documentId, clientId, operations } = await request.json();
+    const json = await request.json();
+    const { documentId, clientId, operations } = json;
+    
     if (!documentId || !Array.isArray(operations)) {
       return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
+
+    // 2. OOM / CPU Hog Prevention: Max operations per request
+    if (operations.length > 500) {
+      return NextResponse.json({ error: 'Too many operations in a single request (Max 500)' }, { status: 413 });
+    }
+
+    // 3. Strict Schema Validation using Zod
+    const parsedOperations = z.array(IncomingOperationSchema).safeParse(operations);
+    if (!parsedOperations.success) {
+      return NextResponse.json({ error: 'Malformed operation payload', details: parsedOperations.error.issues }, { status: 400 });
+    }
+    const validatedOperations = parsedOperations.data;
 
     // Verify permission (must be OWNER or EDITOR)
     const doc = await prisma.document.findUnique({
@@ -52,20 +78,20 @@ export async function POST(request: Request) {
     await publishSyncEvent(documentId, {
       type: 'sync',
       clientId, // The sender's ID
-      blocks: operations.map((op: IncomingOperation) => op.payload)
+      blocks: validatedOperations.map((op: IncomingOperation) => op.payload)
     });
 
     // 2. Offload all CRDT resolution and database writes to a background task
     (async () => {
       try {
-        const blockIds = operations.map((op: IncomingOperation) => op.payload.id);
+        const blockIds = validatedOperations.map((op: IncomingOperation) => op.payload.id);
         const existingBlocks = await prisma.block.findMany({ where: { id: { in: blockIds } } });
         const existingMap = new Map(existingBlocks.map((b: Block) => [b.id, b]));
 
         const blockUpdates = new Map();
         const logsData: { documentId: string; operation: string; clientId: string }[] = [];
 
-        for (const op of operations) {
+        for (const op of validatedOperations) {
           const b = op.payload;
           const existing = blockUpdates.get(b.id) || existingMap.get(b.id);
 
@@ -140,7 +166,7 @@ export async function POST(request: Request) {
     })();
 
     // 3. Return instantly to unblock the client!
-    return NextResponse.json({ success: true, appliedCount: operations.length });
+    return NextResponse.json({ success: true, appliedCount: validatedOperations.length });
   } catch (error) {
     console.error('Sync error:', error);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
