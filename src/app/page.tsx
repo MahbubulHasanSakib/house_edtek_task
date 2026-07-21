@@ -29,23 +29,33 @@ export default async function Dashboard() {
           </h1>
           <p className="text-muted-foreground font-medium">Logged in as <span className="text-foreground">{session.email}</span></p>
         </div>
-        <form action="/api/document/create" method="POST">
-          <button 
-            type="submit" 
-            className="group relative flex items-center gap-2 bg-primary hover:bg-primary/90 text-white px-6 py-3 rounded-full transition-all duration-300 font-semibold shadow-[0_0_20px_rgba(139,92,246,0.3)] hover:shadow-[0_0_30px_rgba(139,92,246,0.5)] hover:-translate-y-0.5"
-          >
-            <div className="absolute inset-0 rounded-full bg-white opacity-0 group-hover:opacity-10 transition-opacity"></div>
-            <Plus size={20} className="transition-transform group-hover:rotate-90 duration-300" />
-            New Document
-          </button>
-        </form>
+        <div className="flex gap-4">
+          <form action="/api/auth/logout" method="POST">
+            <button
+              type="submit"
+              className="group relative flex items-center gap-2 bg-white/5 border border-white/10 hover:bg-white/10 text-white px-6 py-3 rounded-full transition-all duration-300 font-semibold"
+            >
+              Logout
+            </button>
+          </form>
+          <form action="/api/document/create" method="POST">
+            <button
+              type="submit"
+              className="group relative flex items-center gap-2 bg-primary hover:bg-primary/90 text-white px-6 py-3 rounded-full transition-all duration-300 font-semibold shadow-[0_0_20px_rgba(139,92,246,0.3)] hover:shadow-[0_0_30px_rgba(139,92,246,0.5)] hover:-translate-y-0.5"
+            >
+              <div className="absolute inset-0 rounded-full bg-white opacity-0 group-hover:opacity-10 transition-opacity"></div>
+              <Plus size={20} className="transition-transform group-hover:rotate-90 duration-300" />
+              New Document
+            </button>
+          </form>
+        </div>
       </header>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 relative z-10">
         {documents.map(doc => (
           <Link key={doc.id} href={`/document/${doc.id}`} className="group block h-full">
             <div className="glass p-6 rounded-2xl border border-white/5 hover:border-primary/40 transition-all duration-500 cursor-pointer h-48 flex flex-col justify-between relative overflow-hidden group-hover:shadow-[0_8px_30px_rgba(0,0,0,0.12)] group-hover:-translate-y-1">
-              
+
               {/* Subtle hover gradient background */}
               <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
 
@@ -62,7 +72,7 @@ export default async function Dashboard() {
                   {doc.title}
                 </h2>
               </div>
-              
+
               <div className="relative z-10 mt-4">
                 <p className="text-xs font-medium text-muted-foreground/70">
                   Last updated {new Date(doc.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
