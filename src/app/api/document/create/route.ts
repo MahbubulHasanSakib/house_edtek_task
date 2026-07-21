@@ -3,11 +3,11 @@ import prisma from '@/lib/server/db';
 import { getSession } from '@/lib/server/auth';
 import { generateFractionalIndex } from '@/lib/client/fractional-indexing';
 
-export async function POST() {
+export async function POST(request: Request) {
   try {
     const session = await getSession();
     if (!session) {
-      return NextResponse.redirect(new URL('/login', 'http://localhost:3000'));
+      return NextResponse.redirect(new URL('/login', request.url), 303);
     }
 
     const doc = await prisma.document.create({
@@ -33,7 +33,7 @@ export async function POST() {
       }
     });
 
-    return NextResponse.redirect(new URL(`/document/${doc.id}`, 'http://localhost:3000'));
+    return NextResponse.redirect(new URL(`/document/${doc.id}`, request.url), 303);
   } catch (error) {
     console.error('Document creation error:', error);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
